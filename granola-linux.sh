@@ -15,6 +15,13 @@ info() { printf '    %s\n' "$*"; }
 [[ -n "$DMG" ]] || die "usage: $0 <path-to-granola.dmg>   (INSTALL_DIR=$INSTALL_DIR)"
 [[ -f "$DMG" ]] || die "no such file: $DMG"
 
+# Electron's release artifacts call the architectures x64 and arm64.
+case "${GRANOLA_ARCH:-$(uname -m)}" in
+  x86_64|x64)    ARCH=x64 ;;
+  aarch64|arm64) ARCH=arm64 ;;
+  *) die "unsupported architecture: $(uname -m) (need x86_64 or aarch64)" ;;
+esac
+
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$CACHE_DIR"
 
@@ -30,6 +37,7 @@ SEVENZZ="$(command -v 7zz || true)"
 if [[ -z "$SEVENZZ" ]]; then
   SEVENZZ="$CACHE_DIR/7zz"
   if [[ ! -x "$SEVENZZ" ]]; then
+    [[ "$ARCH" == x64 ]] || die "7zz not found and the static download is x86-64 only; install 7zz (>= 21.01) and re-run"
     info "7zz not found, downloading the official static build (LZFSE support)"
     curl -fsSL -o "$WORK/7z.tar.xz" https://www.7-zip.org/a/7z2501-linux-x64.tar.xz \
       || die "could not download 7zz; install it manually and re-run"
@@ -62,9 +70,9 @@ info "Electron $EL_VER"
 
 step "Fetching the Linux Electron runtime"
 
-ZIP="$CACHE_DIR/electron-v$EL_VER-linux-x64.zip"
+ZIP="$CACHE_DIR/electron-v$EL_VER-linux-$ARCH.zip"
 if [[ ! -f "$ZIP" ]]; then
-  URL="https://github.com/electron/electron/releases/download/v$EL_VER/electron-v$EL_VER-linux-x64.zip"
+  URL="https://github.com/electron/electron/releases/download/v$EL_VER/electron-v$EL_VER-linux-$ARCH.zip"
   info "downloading $URL"
   curl -fL --progress-bar -o "$ZIP.part" "$URL" || die "download failed"
   mv "$ZIP.part" "$ZIP"
@@ -134,8 +142,11 @@ cp -r "$BS3" "$WORK/bs3"
     && tar xzf better-sqlite3-multiple-ciphers-*.tgz ) || die "could not fetch binding.gyp from npm"
 cp "$WORK/package/binding.gyp" "$WORK/bs3/"
 
+# Deliberately npx, not a system node-gyp: some distros (e.g. nixpkgs) wrap
+# node-gyp to force npm_config_nodedir to their own Node headers, which would
+# silently override --dist-url and build against the wrong ABI.
 ( cd "$WORK/bs3" && CC="$CC" CXX="$CXX" npx --yes node-gyp rebuild --release \
-    --runtime=electron --target="$EL_VER" --arch=x64 \
+    --runtime=electron --target="$EL_VER" --arch="$ARCH" \
     --dist-url=https://electronjs.org/headers ) >"$WORK/build.log" 2>&1 \
   || { tail -30 "$WORK/build.log"; die "native build failed (full log: $WORK/build.log)"; }
 
@@ -145,10 +156,13 @@ cp "$WORK/bs3/build/Release/better_sqlite3.node" \
 
 step "Installing launcher and desktop entry"
 
+# GRANOLA_FHS_RUN (set by the Nix flake) wraps electron in an FHS environment,
+# because the prebuilt binary's /lib64 interpreter does not exist on NixOS.
+RUNNER="${GRANOLA_FHS_RUN:-}"
 cat > "$INSTALL_DIR/granola.sh" <<EOF
 #!/usr/bin/env bash
 DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
-exec "\$DIR/electron" --ozone-platform-hint=auto "\$@"
+exec ${RUNNER:+"$RUNNER" }"\$DIR/electron" --ozone-platform-hint=auto "\$@"
 EOF
 chmod +x "$INSTALL_DIR/granola.sh"
 
@@ -174,7 +188,7 @@ command -v xdg-mime >/dev/null && xdg-mime default "$(basename "$DESKTOP_FILE")"
 step "Smoke-testing the native module"
 
 ELECTRON_RUN_AS_NODE=1 NODE_PATH="$INSTALL_DIR/resources/app.asar/node_modules" \
-  "$INSTALL_DIR/electron" -e "
+  ${RUNNER:+"$RUNNER"} "$INSTALL_DIR/electron" -e "
     const Database = require('$BS3/lib/index.js');
     const db = new Database('$WORK/smoke.db');
     db.pragma(\"cipher='sqlcipher'\");

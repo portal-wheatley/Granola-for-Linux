@@ -13,7 +13,19 @@
 
 That is it. The script installs to `~/Applications/granola`, adds a desktop entry, registers the `granola://` sign-in handler, and tests the build before it tells you it worked. Run `./uninstall.sh` to undo it.
 
-Set `INSTALL_DIR=` to install somewhere else. You need x86-64 and g++ 11 or newer. Tested on Pop!\_OS (Ubuntu 20.04 base, glibc 2.32) with Granola 7.452.1 and Electron 42.7.0.
+Set `INSTALL_DIR=` to install somewhere else. You need x86-64 or aarch64 and g++ 11 or newer. Tested on Pop!\_OS (Ubuntu 20.04 base, glibc 2.32) with Granola 7.452.1 and Electron 42.7.0.
+
+## Run it with Nix
+
+There is a flake, so with Nix installed (any distro, NixOS included) you can skip step 2 entirely:
+
+```
+nix run github:portal-wheatley/Granola-for-Linux -- "Granola - AI Notepad.dmg"
+```
+
+This brings its own 7zz, Node, Python, and compiler, works on `x86_64-linux` and `aarch64-linux` (the Electron runtime and native build are arch-detected), and wraps the launcher in an FHS environment so the prebuilt Electron binary also runs on NixOS, which has no `/lib64` loader. The install still lands in `~/Applications/granola` with a desktop entry.
+
+One caveat: the generated launcher points at the FHS wrapper in the Nix store. If `nix-collect-garbage` removes it, just run the command above again.
 
 ## What works
 
