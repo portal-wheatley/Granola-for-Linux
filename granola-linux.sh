@@ -100,6 +100,73 @@ APP_VER="$(grep -A1 CFBundleShortVersionString "$WORK/appinfo/Info.plist" 2>/dev
 info "Granola ${APP_VER:-?} payload installed"
 
 
+step "Stubbing macOS-only native plugins"
+
+# Newer Granola builds require() electron-click-drag-plugin in the main
+# process at startup, but the .dmg ships no drag.node binary for it, so the
+# app dies at boot with "Cannot find module ... drag.node". The plugin only
+# implements click-through window dragging on macOS; replace it with a stub
+# whose every export is a no-op.
+#
+# The stub is a different length than the original, so the asar has to be
+# repacked properly (the in-place trick used for the platform patch below
+# only works for same-length edits). Repacking must keep the same entries
+# unpacked as the original, or the native sqlite build below would end up
+# packed where Electron cannot dlopen it.
+ASAR="$INSTALL_DIR/resources/app.asar"
+if npx --yes @electron/asar list "$ASAR" | grep -qx '/node_modules/electron-click-drag-plugin'; then
+  info "electron-click-drag-plugin found; replacing it with a no-op stub"
+
+  npx --yes @electron/asar list --is-pack "$ASAR" > "$WORK/asar-list.txt"
+  npx --yes @electron/asar extract "$ASAR" "$WORK/asar-ext"
+
+  cat > "$WORK/asar-ext/node_modules/electron-click-drag-plugin/index.js" <<'JSEOF'
+// Linux stub installed by granola-linux.sh. The real module is a macOS-only
+// native addon for click-through window dragging; every export is a no-op.
+module.exports = new Proxy({}, { get: () => () => {} });
+JSEOF
+  python3 - "$WORK/asar-ext/node_modules/electron-click-drag-plugin/package.json" <<'PYEOF'
+import json, sys, pathlib
+p = pathlib.Path(sys.argv[1])
+meta = json.loads(p.read_text()); meta["main"] = "index.js"
+p.write_text(json.dumps(meta, indent=2))
+PYEOF
+
+  # Minimal unpacked roots = unpacked entries whose parent is packed.
+  mapfile -t UNPACK_ROOTS < <(python3 - "$WORK/asar-list.txt" <<'PYEOF'
+import sys
+state = {}
+for line in open(sys.argv[1]):
+    kind, _, path = line.rstrip("\n").partition(" : ")
+    if path:
+        state[path] = kind.strip()
+for path, kind in state.items():
+    parent = path.rsplit("/", 1)[0] or "/"
+    if kind == "unpack" and state.get(parent, "pack") != "unpack":
+        print(path.lstrip("/"))
+PYEOF
+)
+  UNPACK_DIRS=(); UNPACK_FILES=()
+  for r in "${UNPACK_ROOTS[@]}"; do
+    if [[ -d "$WORK/asar-ext/$r" ]]; then UNPACK_DIRS+=("$r"); else UNPACK_FILES+=("$r"); fi
+  done
+  # minimatch quirk: a single-element brace glob like {a} matches nothing,
+  # so always keep a dummy second element.
+  PACK_ARGS=()
+  [[ ${#UNPACK_DIRS[@]}  -gt 0 ]] && PACK_ARGS+=(--unpack-dir "{$(IFS=,; echo "${UNPACK_DIRS[*]}"),__none__}")
+  [[ ${#UNPACK_FILES[@]} -gt 0 ]] && PACK_ARGS+=(--unpack "{$(IFS=,; echo "${UNPACK_FILES[*]}"),__none__}")
+
+  npx --yes @electron/asar pack "$WORK/asar-ext" "$WORK/app.asar" "${PACK_ARGS[@]}" \
+    || die "could not repack app.asar"
+  rm -rf "$ASAR" "$INSTALL_DIR/resources/app.asar.unpacked"
+  mv "$WORK/app.asar" "$ASAR"
+  [[ -d "$WORK/app.asar.unpacked" ]] && mv "$WORK/app.asar.unpacked" "$INSTALL_DIR/resources/app.asar.unpacked"
+  rm -rf "$WORK/asar-ext"
+else
+  info "not present in this version, nothing to do"
+fi
+
+
 step "Patching the platform string"
 
 # api.granola.ai answers 500 Internal Server Error to any request carrying
