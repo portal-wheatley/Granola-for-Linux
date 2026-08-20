@@ -132,32 +132,46 @@ meta = json.loads(p.read_text()); meta["main"] = "index.js"
 p.write_text(json.dumps(meta, indent=2))
 PYEOF
 
-  # Minimal unpacked roots = unpacked entries whose parent is packed.
-  mapfile -t UNPACK_ROOTS < <(python3 - "$WORK/asar-list.txt" <<'PYEOF'
+  # Asars usually mark only *files* as unpacked (their directories stay
+  # "pack"), and asar's --unpack glob does not match relative paths on
+  # repack, so express everything as directories for --unpack-dir: take the
+  # parent dir of every unpacked file, plus unpacked dirs themselves, and
+  # reduce to a minimal set. Unpacking a superset is harmless -- Electron
+  # resolves packed and unpacked entries the same way.
+  mapfile -t UNPACK_DIRS < <(python3 - "$WORK/asar-list.txt" <<'PYEOF'
 import sys
 state = {}
 for line in open(sys.argv[1]):
     kind, _, path = line.rstrip("\n").partition(" : ")
     if path:
         state[path] = kind.strip()
+dirs = set()
 for path, kind in state.items():
-    parent = path.rsplit("/", 1)[0] or "/"
-    if kind == "unpack" and state.get(parent, "pack") != "unpack":
-        print(path.lstrip("/"))
+    if kind != "unpack":
+        continue
+    d = path if path in state and any(k.startswith(path + "/") for k in state) else path.rsplit("/", 1)[0]
+    if d in ("", "/"):
+        sys.exit("an unpacked file sits at the asar root; refusing to unpack everything")
+    dirs.add(d)
+minimal = [d for d in dirs if not any(d != o and d.startswith(o + "/") for o in dirs)]
+for d in sorted(minimal):
+    print(d.lstrip("/"))
 PYEOF
-)
-  UNPACK_DIRS=(); UNPACK_FILES=()
-  for r in "${UNPACK_ROOTS[@]}"; do
-    if [[ -d "$WORK/asar-ext/$r" ]]; then UNPACK_DIRS+=("$r"); else UNPACK_FILES+=("$r"); fi
-  done
+) || die "could not compute the unpacked file set"
+
   # minimatch quirk: a single-element brace glob like {a} matches nothing,
   # so always keep a dummy second element.
   PACK_ARGS=()
-  [[ ${#UNPACK_DIRS[@]}  -gt 0 ]] && PACK_ARGS+=(--unpack-dir "{$(IFS=,; echo "${UNPACK_DIRS[*]}"),__none__}")
-  [[ ${#UNPACK_FILES[@]} -gt 0 ]] && PACK_ARGS+=(--unpack "{$(IFS=,; echo "${UNPACK_FILES[*]}"),__none__}")
+  [[ ${#UNPACK_DIRS[@]} -gt 0 ]] && PACK_ARGS+=(--unpack-dir "{$(IFS=,; echo "${UNPACK_DIRS[*]}"),__none__}")
 
   npx --yes @electron/asar pack "$WORK/asar-ext" "$WORK/app.asar" "${PACK_ARGS[@]}" \
     || die "could not repack app.asar"
+
+  # Repacking silently producing no unpacked dir would only surface much
+  # later as a cryptic dlopen failure, so fail loudly here instead.
+  if [[ ${#UNPACK_DIRS[@]} -gt 0 && ! -d "$WORK/app.asar.unpacked" ]]; then
+    die "asar repack lost the unpacked files (expected: ${UNPACK_DIRS[*]})"
+  fi
   rm -rf "$ASAR" "$INSTALL_DIR/resources/app.asar.unpacked"
   mv "$WORK/app.asar" "$ASAR"
   [[ -d "$WORK/app.asar.unpacked" ]] && mv "$WORK/app.asar.unpacked" "$INSTALL_DIR/resources/app.asar.unpacked"
