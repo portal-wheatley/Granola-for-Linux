@@ -114,11 +114,22 @@ step "Stubbing macOS-only native plugins"
 # unpacked as the original, or the native sqlite build below would end up
 # packed where Electron cannot dlopen it.
 ASAR="$INSTALL_DIR/resources/app.asar"
-if npx --yes @electron/asar list "$ASAR" | grep -qx '/node_modules/electron-click-drag-plugin'; then
+
+# Local install of @electron/asar. Its CLI cannot be used for packing: the
+# argument parser truncates --unpack-dir at the first comma, so a brace glob
+# like {a,b} silently degrades to just "a" and most unpacked files end up
+# packed. Packing goes through the JS API instead, which gets the pattern
+# verbatim; list/extract have no such arguments and can use the CLI.
+( cd "$WORK" && mkdir -p asar-tool && cd asar-tool \
+    && npm init -y >/dev/null 2>&1 && npm install --silent @electron/asar >/dev/null 2>&1 ) \
+  || die "could not install @electron/asar from npm"
+ASAR_BIN="$WORK/asar-tool/node_modules/.bin/asar"
+
+if "$ASAR_BIN" list "$ASAR" | grep -qx '/node_modules/electron-click-drag-plugin'; then
   info "electron-click-drag-plugin found; replacing it with a no-op stub"
 
-  npx --yes @electron/asar list --is-pack "$ASAR" > "$WORK/asar-list.txt"
-  npx --yes @electron/asar extract "$ASAR" "$WORK/asar-ext"
+  "$ASAR_BIN" list --is-pack "$ASAR" > "$WORK/asar-list.txt"
+  "$ASAR_BIN" extract "$ASAR" "$WORK/asar-ext"
 
   cat > "$WORK/asar-ext/node_modules/electron-click-drag-plugin/index.js" <<'JSEOF'
 // Linux stub installed by granola-linux.sh. The real module is a macOS-only
@@ -161,17 +172,22 @@ PYEOF
 
   # minimatch quirk: a single-element brace glob like {a} matches nothing,
   # so always keep a dummy second element.
-  PACK_ARGS=()
-  [[ ${#UNPACK_DIRS[@]} -gt 0 ]] && PACK_ARGS+=(--unpack-dir "{$(IFS=,; echo "${UNPACK_DIRS[*]}"),__none__}")
+  UNPACK_GLOB="{$(IFS=,; echo "${UNPACK_DIRS[*]}"),__none__}"
 
-  npx --yes @electron/asar pack "$WORK/asar-ext" "$WORK/app.asar" "${PACK_ARGS[@]}" \
-    || die "could not repack app.asar"
+  SRC="$WORK/asar-ext" DEST="$WORK/app.asar" \
+  ASAR_LIB="$WORK/asar-tool/node_modules/@electron/asar/lib/asar.js" \
+  UNPACK_GLOB="$UNPACK_GLOB" node - <<'JSEOF' || die "could not repack app.asar"
+const { SRC, DEST, ASAR_LIB, UNPACK_GLOB } = process.env;
+import(ASAR_LIB)
+  .then(asar => asar.createPackageWithOptions(SRC, DEST, { unpackDir: UNPACK_GLOB, dot: true }))
+  .catch(err => { console.error(err); process.exit(1); });
+JSEOF
 
-  # Repacking silently producing no unpacked dir would only surface much
-  # later as a cryptic dlopen failure, so fail loudly here instead.
-  if [[ ${#UNPACK_DIRS[@]} -gt 0 && ! -d "$WORK/app.asar.unpacked" ]]; then
-    die "asar repack lost the unpacked files (expected: ${UNPACK_DIRS[*]})"
-  fi
+  # A repack that quietly loses unpacked files would only surface much later
+  # as a cryptic module-not-found, so verify every root landed on disk.
+  for r in "${UNPACK_DIRS[@]}"; do
+    [[ -e "$WORK/app.asar.unpacked/$r" ]] || die "asar repack lost unpacked files: $r missing"
+  done
   rm -rf "$ASAR" "$INSTALL_DIR/resources/app.asar.unpacked"
   mv "$WORK/app.asar" "$ASAR"
   [[ -d "$WORK/app.asar.unpacked" ]] && mv "$WORK/app.asar.unpacked" "$INSTALL_DIR/resources/app.asar.unpacked"
