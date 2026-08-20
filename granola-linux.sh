@@ -277,9 +277,20 @@ StartupWMClass=granola
 MimeType=x-scheme-handler/granola;
 EOF
 
-command -v update-desktop-database >/dev/null && update-desktop-database "$(dirname "$DESKTOP_FILE")" 2>/dev/null || true
-
-command -v xdg-mime >/dev/null && xdg-mime default "$(basename "$DESKTOP_FILE")" x-scheme-handler/granola 2>/dev/null || true
+# Sign-in hands control back from the browser through a granola:// URL, so
+# these registrations are not optional: without them the "go back to the
+# app" link in the browser does nothing.
+if command -v update-desktop-database >/dev/null; then
+  update-desktop-database "$(dirname "$DESKTOP_FILE")" 2>/dev/null || true
+else
+  info "WARNING: update-desktop-database not found; browsers may not see the granola:// handler"
+fi
+if command -v xdg-mime >/dev/null; then
+  xdg-mime default "$(basename "$DESKTOP_FILE")" x-scheme-handler/granola 2>/dev/null \
+    || info "WARNING: xdg-mime registration failed; the sign-in redirect will not work"
+else
+  info "WARNING: xdg-mime not found; the granola:// sign-in redirect will not work"
+fi
 
 
 step "Smoke-testing the native module"

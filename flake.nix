@@ -71,12 +71,14 @@
           granola-linux = pkgs.writeShellApplication {
             name = "granola-linux";
             runtimeInputs = with pkgs; [
-              _7zz          # LZFSE-capable 7-Zip for reading the .dmg
+              _7zz               # LZFSE-capable 7-Zip for reading the .dmg
               curl
+              desktop-file-utils # update-desktop-database: browsers find the granola:// handler
               gcc
               gnumake
               nodejs
               python3
+              xdg-utils          # xdg-mime: register the granola:// scheme for sign-in
             ];
             text = ''
               export GRANOLA_ARCH=${electronArch}
