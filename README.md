@@ -13,7 +13,19 @@
 
 That is it. The script installs to `~/Applications/granola`, adds a desktop entry, registers the `granola://` sign-in handler, and tests the build before it tells you it worked. Run `./uninstall.sh` to undo it.
 
-Set `INSTALL_DIR=` to install somewhere else. You need x86-64 and g++ 11 or newer. Tested on Pop!\_OS (Ubuntu 20.04 base, glibc 2.32) with Granola 7.452.1 and Electron 42.7.0.
+Set `INSTALL_DIR=` to install somewhere else. You need x86-64 or aarch64 and g++ 11 or newer. Tested on Pop!\_OS (Ubuntu 20.04 base, glibc 2.32) with Granola 7.452.1 and Electron 42.7.0.
+
+## Run it with Nix
+
+There is a flake, so with Nix installed (any distro, NixOS included) you can skip step 2 entirely:
+
+```
+nix run github:portal-wheatley/Granola-for-Linux -- "Granola - AI Notepad.dmg"
+```
+
+This brings its own 7zz, Node, Python, and compiler, works on `x86_64-linux` and `aarch64-linux` (the Electron runtime and native build are arch-detected), and wraps the launcher in an FHS environment so the prebuilt Electron binary also runs on NixOS, which has no `/lib64` loader. The install still lands in `~/Applications/granola` with a desktop entry.
+
+One caveat: the generated launcher points at the FHS wrapper in the Nix store. If `nix-collect-garbage` removes it, just run the command above again.
 
 ## What works
 
@@ -30,16 +42,17 @@ Set `INSTALL_DIR=` to install somewhere else. You need x86-64 and g++ 11 or newe
 
 ## Build it yourself
 
-If you would rather not run the script, the conversion takes six steps:
+If you would rather not run the script, the conversion takes seven steps:
 
 1. Extract the `.dmg` with a modern `7zz`. The `p7zip` in most distros cannot read its LZFSE compression.
 2. Read the Electron version out of `Electron Framework.framework/.../Info.plist`, then download that exact Linux build.
 3. Unzip the Linux runtime into your install folder and delete `resources/default_app.asar`.
 4. Copy `app.asar`, `app.asar.unpacked`, and `icons/` from the bundle into the runtime's `resources/`. Skip every Mac binary, since they all sit behind `darwin` checks.
-5. Patch the platform string inside `app.asar` so it reports `Windows`. Granola's API returns a 500 error for `platform=linux`, so sign-in fails without this.
-6. Rebuild `better-sqlite3-multiple-ciphers` from the C++ source inside `app.asar.unpacked` using g++ 11 or newer. Granola's version adds an `updateHook()` that no public build has.
+5. Stub out `electron-click-drag-plugin` if the app bundles it. Newer Granola versions load this macOS-only native addon at startup, but the `.dmg` does not ship its binary, so the main process crashes with "Cannot find module ... drag.node". Replacing its `index.js` means properly repacking `app.asar` while keeping the same files unpacked.
+6. Patch the platform string inside `app.asar` so it reports `Windows`. Granola's API returns a 500 error for `platform=linux`, so sign-in fails without this.
+7. Rebuild `better-sqlite3-multiple-ciphers` from the C++ source inside `app.asar.unpacked` using g++ 11 or newer. Granola's version adds an `updateHook()` that no public build has.
 
-Four of those six fail with errors that do not point at the real cause. `granola-linux.sh` has the exact commands, with comments explaining each one.
+Most of those steps fail with errors that do not point at the real cause. `granola-linux.sh` has the exact commands, with comments explaining each one.
 
 ## Notes
 
