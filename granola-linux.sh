@@ -100,15 +100,9 @@ APP_VER="$(grep -A1 CFBundleShortVersionString "$WORK/appinfo/Info.plist" 2>/dev
 info "Granola ${APP_VER:-?} payload installed"
 
 
-step "Stubbing macOS-only native plugins"
+step "Patching the app bundle for Linux"
 
-# Newer Granola builds require() electron-click-drag-plugin in the main
-# process at startup, but the .dmg ships no drag.node binary for it, so the
-# app dies at boot with "Cannot find module ... drag.node". The plugin only
-# implements click-through window dragging on macOS; replace it with a stub
-# whose every export is a no-op.
-#
-# The stub is a different length than the original, so the asar has to be
+# Every edit here changes file lengths, so the asar is unpacked, patched and
 # repacked properly (the in-place trick used for the platform patch below
 # only works for same-length edits). Repacking must keep the same entries
 # unpacked as the original, or the native sqlite build below would end up
@@ -125,12 +119,16 @@ ASAR="$INSTALL_DIR/resources/app.asar"
   || die "could not install @electron/asar from npm"
 ASAR_BIN="$WORK/asar-tool/node_modules/.bin/asar"
 
-if "$ASAR_BIN" list "$ASAR" | grep -qx '/node_modules/electron-click-drag-plugin'; then
+"$ASAR_BIN" list --is-pack "$ASAR" > "$WORK/asar-list.txt"
+"$ASAR_BIN" extract "$ASAR" "$WORK/asar-ext"
+
+# Newer Granola builds require() electron-click-drag-plugin in the main
+# process at startup, but the .dmg ships no drag.node binary for it, so the
+# app dies at boot with "Cannot find module ... drag.node". The plugin only
+# implements click-through window dragging on macOS; replace it with a stub
+# whose every export is a no-op.
+if [[ -d "$WORK/asar-ext/node_modules/electron-click-drag-plugin" ]]; then
   info "electron-click-drag-plugin found; replacing it with a no-op stub"
-
-  "$ASAR_BIN" list --is-pack "$ASAR" > "$WORK/asar-list.txt"
-  "$ASAR_BIN" extract "$ASAR" "$WORK/asar-ext"
-
   cat > "$WORK/asar-ext/node_modules/electron-click-drag-plugin/index.js" <<'JSEOF'
 // Linux stub installed by granola-linux.sh. The real module is a macOS-only
 // native addon for click-through window dragging; every export is a no-op.
@@ -142,14 +140,68 @@ p = pathlib.Path(sys.argv[1])
 meta = json.loads(p.read_text()); meta["main"] = "index.js"
 p.write_text(json.dumps(meta, indent=2))
 PYEOF
+fi
 
-  # Asars usually mark only *files* as unpacked (their directories stay
-  # "pack"), and asar's --unpack glob does not match relative paths on
-  # repack, so express everything as directories for --unpack-dir: take the
-  # parent dir of every unpacked file, plus unpacked dirs themselves, and
-  # reduce to a minimal set. Unpacking a superset is harmless -- Electron
-  # resolves packed and unpacked entries the same way.
-  mapfile -t UNPACK_DIRS < <(python3 - "$WORK/asar-list.txt" <<'PYEOF'
+# Source-level fixes to the main process. The bundle is minified, so each
+# patch matches on the surrounding code shape and captures whatever local
+# identifiers the bundler picked; a patch that no longer matches only costs
+# its feature, so it warns instead of failing the install.
+#
+# 1. Browser extension. Granola's Chrome extension reaches the app through a
+#    Chrome native messaging host named com.granola.app. The app writes the
+#    host manifest into each installed browser's profile directory, but it
+#    only knows the macOS (~/Library/Application Support/...) and Windows
+#    (registry) locations; on Linux it finds no browsers and installs
+#    nothing. Teach it the XDG paths Chromium-based browsers read on Linux.
+#
+# 2. Microphone permission. On Linux the app captures audio through the
+#    browser (getUserMedia) path, whose permission prompt calls
+#    systemPreferences.askForMediaAccess. That API only exists on macOS, so
+#    the call throws and the renderer's permission request never resolves.
+#    Linux has no OS-level microphone prompt, so report it as granted.
+python3 - "$WORK/asar-ext/dist-electron/main/index.js" <<'PYEOF'
+import re, sys, pathlib
+p = pathlib.Path(sys.argv[1]); src = p.read_text()
+
+def apply(name, pattern, replacement):
+    global src
+    src, n = re.subn(pattern, lambda m: replacement(m), src, count=1)
+    if n:
+        print(f"    patched: {name}")
+    else:
+        print(f"    WARNING: could not patch {name}; Granola's bundler output may have changed")
+
+# Linux profile roots for the browsers Granola knows about, keyed by the
+# `name` field of its browser table. Only the first existing directory gets
+# the manifest. Flatpak and Snap browsers are sandboxed and cannot exec a
+# host on the real filesystem, so they are deliberately not listed.
+helper = r'''function __granolaLinuxBrowserDir(e){var p=require("node:path"),o=require("node:os"),f=require("node:fs"),c=process.env.XDG_CONFIG_HOME||p.join(o.homedir(),".config"),m={Chrome:["google-chrome","google-chrome-beta","google-chrome-unstable"],Brave:["BraveSoftware/Brave-Browser"],Edge:["microsoft-edge","microsoft-edge-beta","microsoft-edge-dev"],Chromium:["chromium"],Vivaldi:["vivaldi"],Opera:["opera"]},l=(m[e.name]||["granola-unsupported-browser-"+String(e.name).replace(/\W/g,"")]).map(function(d){return p.join(c,d)});return l.find(function(d){return f.existsSync(d)})||l[0]}'''
+
+# function rV(e){return process.platform===`win32`?s.join(o.homedir(),`AppData`,`Local`,`Granola`,`NativeMessagingHosts`):s.join(o.homedir(),`Library`,`Application Support`,...e.macPathSegments,`NativeMessagingHosts`)}
+apply("native messaging manifest directory",
+    r'function (\w+)\((\w+)\)\{return process\.platform===`win32`\?(\w+)\.join\((\w+)\.homedir\(\),`AppData`,`Local`,`Granola`,`NativeMessagingHosts`\):\3\.join\(\4\.homedir\(\),`Library`,`Application Support`,\.\.\.\2\.macPathSegments,`NativeMessagingHosts`\)\}',
+    lambda m: helper + m.expand(r'function \1(\2){if(process.platform===`linux`)return \3.join(__granolaLinuxBrowserDir(\2),`NativeMessagingHosts`);return process.platform===`win32`?\3.join(\4.homedir(),`AppData`,`Local`,`Granola`,`NativeMessagingHosts`):\3.join(\4.homedir(),`Library`,`Application Support`,...\2.macPathSegments,`NativeMessagingHosts`)}'))
+
+# function tIe(e){return process.platform===`win32`?null:s.join(o.homedir(),`Library`,`Application Support`,...e.macPathSegments)}
+apply("browser profile detection",
+    r'function (\w+)\((\w+)\)\{return process\.platform===`win32`\?null:(\w+)\.join\((\w+)\.homedir\(\),`Library`,`Application Support`,\.\.\.\2\.macPathSegments\)\}',
+    lambda m: m.expand(r'function \1(\2){if(process.platform===`linux`)return __granolaLinuxBrowserDir(\2);return process.platform===`win32`?null:\3.join(\4.homedir(),`Library`,`Application Support`,...\2.macPathSegments)}'))
+
+# e(await I.systemPreferences.askForMediaAccess(`microphone`))
+apply("microphone permission prompt",
+    r'await (\w+)\.systemPreferences\.askForMediaAccess\(`microphone`\)',
+    lambda m: m.expand(r'(process.platform===`darwin`?await \1.systemPreferences.askForMediaAccess(`microphone`):!0)'))
+
+p.write_text(src)
+PYEOF
+
+# Asars usually mark only *files* as unpacked (their directories stay
+# "pack"), and asar's --unpack glob does not match relative paths on
+# repack, so express everything as directories for --unpack-dir: take the
+# parent dir of every unpacked file, plus unpacked dirs themselves, and
+# reduce to a minimal set. Unpacking a superset is harmless -- Electron
+# resolves packed and unpacked entries the same way.
+mapfile -t UNPACK_DIRS < <(python3 - "$WORK/asar-list.txt" <<'PYEOF'
 import sys
 state = {}
 for line in open(sys.argv[1]):
@@ -170,31 +222,28 @@ for d in sorted(minimal):
 PYEOF
 ) || die "could not compute the unpacked file set"
 
-  # minimatch quirk: a single-element brace glob like {a} matches nothing,
-  # so always keep a dummy second element.
-  UNPACK_GLOB="{$(IFS=,; echo "${UNPACK_DIRS[*]}"),__none__}"
+# minimatch quirk: a single-element brace glob like {a} matches nothing,
+# so always keep a dummy second element.
+UNPACK_GLOB="{$(IFS=,; echo "${UNPACK_DIRS[*]}"),__none__}"
 
-  SRC="$WORK/asar-ext" DEST="$WORK/app.asar" \
-  ASAR_LIB="$WORK/asar-tool/node_modules/@electron/asar/lib/asar.js" \
-  UNPACK_GLOB="$UNPACK_GLOB" node - <<'JSEOF' || die "could not repack app.asar"
+SRC="$WORK/asar-ext" DEST="$WORK/app.asar" \
+ASAR_LIB="$WORK/asar-tool/node_modules/@electron/asar/lib/asar.js" \
+UNPACK_GLOB="$UNPACK_GLOB" node - <<'JSEOF' || die "could not repack app.asar"
 const { SRC, DEST, ASAR_LIB, UNPACK_GLOB } = process.env;
 import(ASAR_LIB)
   .then(asar => asar.createPackageWithOptions(SRC, DEST, { unpackDir: UNPACK_GLOB, dot: true }))
   .catch(err => { console.error(err); process.exit(1); });
 JSEOF
 
-  # A repack that quietly loses unpacked files would only surface much later
-  # as a cryptic module-not-found, so verify every root landed on disk.
-  for r in "${UNPACK_DIRS[@]}"; do
-    [[ -e "$WORK/app.asar.unpacked/$r" ]] || die "asar repack lost unpacked files: $r missing"
-  done
-  rm -rf "$ASAR" "$INSTALL_DIR/resources/app.asar.unpacked"
-  mv "$WORK/app.asar" "$ASAR"
-  [[ -d "$WORK/app.asar.unpacked" ]] && mv "$WORK/app.asar.unpacked" "$INSTALL_DIR/resources/app.asar.unpacked"
-  rm -rf "$WORK/asar-ext"
-else
-  info "not present in this version, nothing to do"
-fi
+# A repack that quietly loses unpacked files would only surface much later
+# as a cryptic module-not-found, so verify every root landed on disk.
+for r in "${UNPACK_DIRS[@]}"; do
+  [[ -e "$WORK/app.asar.unpacked/$r" ]] || die "asar repack lost unpacked files: $r missing"
+done
+rm -rf "$ASAR" "$INSTALL_DIR/resources/app.asar.unpacked"
+mv "$WORK/app.asar" "$ASAR"
+[[ -d "$WORK/app.asar.unpacked" ]] && mv "$WORK/app.asar.unpacked" "$INSTALL_DIR/resources/app.asar.unpacked"
+rm -rf "$WORK/asar-ext"
 
 
 step "Patching the platform string"
@@ -251,15 +300,133 @@ cp "$WORK/bs3/build/Release/better_sqlite3.node" \
    "$WORK/bs3/build/Release/test_extension.node" "$BS3/build/Release/"
 
 
-step "Installing launcher and desktop entry"
+step "Installing the browser extension host"
+
+# Electron decides app.isPackaged from the executable's file name: anything
+# called "electron" counts as a development checkout. Granola keys real
+# behaviour off that flag, so with the stock name it ran as a dev build:
+# it registered the granola-dev:// scheme instead of granola://, downloaded
+# React/Redux devtools on every launch, tagged crash reports as
+# "development", and looked for its native helpers in a source-tree layout.
+# Renaming the binary flips the flag.
+BIN="$INSTALL_DIR/granola"
+mv "$INSTALL_DIR/electron" "$BIN"
 
 # GRANOLA_FHS_RUN (set by the Nix flake) wraps electron in an FHS environment,
 # because the prebuilt binary's /lib64 interpreter does not exist on NixOS.
 RUNNER="${GRANOLA_FHS_RUN:-}"
+
+# The Granola Companion Chrome extension talks to the app through Chrome
+# native messaging: the browser spawns a host program with the message
+# stream on stdin/stdout, and the host relays it to the app over a Unix
+# socket. The .dmg only ships a macOS host binary, so provide one here.
+#
+# Chrome frames each message as a 4-byte native-endian length plus JSON,
+# while the app's socket speaks newline-delimited JSON; the host converts
+# between the two and otherwise passes messages through untouched. It runs
+# on the installed Electron in Node mode, so it needs nothing from the
+# system.
+HOST_DIR="$INSTALL_DIR/resources/native-host"
+mkdir -p "$HOST_DIR"
+cat > "$HOST_DIR/meet-consent-host.js" <<'JSEOF'
+'use strict';
+// Chrome native messaging host for the Granola browser extension (Linux).
+// Bridges Chrome's length-prefixed stdio protocol to Granola's newline-
+// delimited JSON Unix socket. Installed by granola-linux.sh.
+const net = require('node:net');
+const os = require('node:os');
+const crypto = require('node:crypto');
+
+// Must match the app: /tmp/granola-meet-consent-<sha256(home)[:12]>.sock,
+// with the older unsuffixed path as a fallback.
+const suffix = crypto.createHash('sha256').update(os.homedir(), 'utf8').digest('hex').slice(0, 12);
+const socketPaths = [`/tmp/granola-meet-consent-${suffix}.sock`, '/tmp/granola-meet-consent.sock'];
+
+function connect(index) {
+  if (index >= socketPaths.length) {
+    // Granola is not running. Exit; the extension reconnects on its own.
+    process.exit(1);
+  }
+  const socket = net.createConnection(socketPaths[index]);
+  socket.once('error', () => connect(index + 1));
+  socket.once('connect', () => {
+    socket.removeAllListeners('error');
+    bridge(socket);
+  });
+}
+
+function bridge(socket) {
+  let inbound = Buffer.alloc(0);
+  process.stdin.on('data', chunk => {
+    inbound = Buffer.concat([inbound, chunk]);
+    while (inbound.length >= 4) {
+      const length = inbound.readUInt32LE(0);
+      if (inbound.length < 4 + length) break;
+      const message = inbound.subarray(4, 4 + length).toString('utf8');
+      inbound = inbound.subarray(4 + length);
+      socket.write(message.replace(/\n/g, ' ') + '\n');
+    }
+  });
+  process.stdin.on('end', () => socket.end());
+
+  let outbound = '';
+  socket.on('data', chunk => {
+    outbound += chunk.toString('utf8');
+    let newline;
+    while ((newline = outbound.indexOf('\n')) !== -1) {
+      const line = outbound.slice(0, newline);
+      outbound = outbound.slice(newline + 1);
+      if (!line.trim()) continue;
+      const body = Buffer.from(line, 'utf8');
+      const header = Buffer.alloc(4);
+      header.writeUInt32LE(body.length, 0);
+      process.stdout.write(Buffer.concat([header, body]));
+    }
+  });
+  socket.on('error', () => process.exit(0));
+  socket.on('close', () => process.exit(0));
+  process.stdout.on('error', () => process.exit(0));
+}
+
+connect(0);
+JSEOF
+
+cat > "$HOST_DIR/meet-consent-host" <<EOF
+#!/usr/bin/env bash
+# Launched by the browser, not by the user. See meet-consent-host.js.
+DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+export ELECTRON_RUN_AS_NODE=1
+exec ${RUNNER:+"$RUNNER" }"\$DIR/../../granola" "\$DIR/meet-consent-host.js" "\$@"
+EOF
+chmod +x "$HOST_DIR/meet-consent-host"
+info "native messaging host: $HOST_DIR/meet-consent-host"
+info "Granola registers it with Chrome, Chromium, Brave, Edge, Vivaldi and Opera on launch"
+
+
+step "Installing launcher and desktop entry"
+
+# CHROME_DESKTOP tells Electron which .desktop file to name when it
+# registers the granola:// scheme through xdg-settings at startup; without it
+# the registration points at a file that does not exist and can displace
+# the one made below.
+#
+# Output goes to a log file when there is no terminal (the usual case, via
+# the desktop entry) so errors behind a popup can actually be read. The log
+# is appended, not replaced: the sign-in redirect starts a second, short-
+# lived instance that must not wipe the running app's output.
 cat > "$INSTALL_DIR/granola.sh" <<EOF
 #!/usr/bin/env bash
 DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
-exec ${RUNNER:+"$RUNNER" }"\$DIR/electron" --ozone-platform-hint=auto "\$@"
+export CHROME_DESKTOP="$(basename "$DESKTOP_FILE")"
+if [[ -t 2 ]]; then
+  exec ${RUNNER:+"$RUNNER" }"\$DIR/granola" --ozone-platform-hint=auto "\$@"
+fi
+LOG="\${XDG_STATE_HOME:-\$HOME/.local/state}/granola/granola.log"
+mkdir -p "\$(dirname "\$LOG")"
+if [[ -f "\$LOG" && \$(stat -c %s "\$LOG" 2>/dev/null || echo 0) -gt 5000000 ]]; then
+  mv -f "\$LOG" "\$LOG.1"
+fi
+exec ${RUNNER:+"$RUNNER" }"\$DIR/granola" --ozone-platform-hint=auto "\$@" >>"\$LOG" 2>&1
 EOF
 chmod +x "$INSTALL_DIR/granola.sh"
 
@@ -296,7 +463,7 @@ fi
 step "Smoke-testing the native module"
 
 ELECTRON_RUN_AS_NODE=1 NODE_PATH="$INSTALL_DIR/resources/app.asar/node_modules" \
-  ${RUNNER:+"$RUNNER"} "$INSTALL_DIR/electron" -e "
+  ${RUNNER:+"$RUNNER"} "$BIN" -e "
     const Database = require('$BS3/lib/index.js');
     const db = new Database('$WORK/smoke.db');
     db.pragma(\"cipher='sqlcipher'\");

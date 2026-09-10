@@ -35,6 +35,7 @@ One caveat: the generated launcher points at the FHS wrapper in the Nix store. I
 | ✅ | Sign-in with Google, Microsoft, or SSO |
 | ✅ | Encrypted local database that survives restarts |
 | ✅ | Microphone recording |
+| ✅ | The Granola Companion browser extension, in Chrome, Chromium, Brave, Edge, Vivaldi and Opera installed from a normal package. Flatpak and Snap browsers cannot reach the host program from inside their sandbox. |
 | ⚠️ | System audio capture is limited. The macOS build uses Core Audio to hear the other side of a call. On Linux the app falls back to a browser style capture path. |
 | ❌ | Apple Calendar (EventKit). Google and Microsoft calendars still work, since those run on the server. |
 | ❌ | Global hotkeys |
@@ -42,15 +43,19 @@ One caveat: the generated launcher points at the FHS wrapper in the Nix store. I
 
 ## Build it yourself
 
-If you would rather not run the script, the conversion takes seven steps:
+If you would rather not run the script, the conversion takes nine steps:
 
 1. Extract the `.dmg` with a modern `7zz`. The `p7zip` in most distros cannot read its LZFSE compression.
 2. Read the Electron version out of `Electron Framework.framework/.../Info.plist`, then download that exact Linux build.
 3. Unzip the Linux runtime into your install folder and delete `resources/default_app.asar`.
 4. Copy `app.asar`, `app.asar.unpacked`, and `icons/` from the bundle into the runtime's `resources/`. Skip every Mac binary, since they all sit behind `darwin` checks.
 5. Stub out `electron-click-drag-plugin` if the app bundles it. Newer Granola versions load this macOS-only native addon at startup, but the `.dmg` does not ship its binary, so the main process crashes with "Cannot find module ... drag.node". Replacing its `index.js` means properly repacking `app.asar` while keeping the same files unpacked.
-6. Patch the platform string inside `app.asar` so it reports `Windows`. Granola's API returns a 500 error for `platform=linux`, so sign-in fails without this.
-7. Rebuild `better-sqlite3-multiple-ciphers` from the C++ source inside `app.asar.unpacked` using g++ 11 or newer. Granola's version adds an `updateHook()` that no public build has.
+6. While the asar is open, patch two spots in `dist-electron/main/index.js`: teach the browser-extension code the Linux profile directories (`~/.config/google-chrome/NativeMessagingHosts` and friends, it only knows macOS and Windows), and make the microphone permission prompt skip `systemPreferences.askForMediaAccess`, a macOS-only API whose absence leaves the permission request hanging on Linux.
+7. Patch the platform string inside `app.asar` so it reports `Windows`. Granola's API returns a 500 error for `platform=linux`, so sign-in fails without this.
+8. Rename the `electron` binary to `granola`. Electron sets `app.isPackaged` from the executable name, and with the stock name Granola runs as a development build: it registers `granola-dev://` instead of `granola://`, downloads React devtools on every launch, and looks for its helpers in a source-tree layout.
+9. Rebuild `better-sqlite3-multiple-ciphers` from the C++ source inside `app.asar.unpacked` using g++ 11 or newer. Granola's version adds an `updateHook()` that no public build has.
+
+The browser extension also needs a native messaging host at `resources/native-host/meet-consent-host`. The `.dmg` only ships a macOS one. The script installs a small Node program that bridges Chrome's length-prefixed stdio protocol to the newline-delimited JSON Unix socket the app listens on, and the app writes the host manifest into every installed browser's profile the next time it starts.
 
 Most of those steps fail with errors that do not point at the real cause. `granola-linux.sh` has the exact commands, with comments explaining each one.
 
@@ -60,3 +65,4 @@ Most of those steps fail with errors that do not point at the real cause. `grano
 - Granola's code belongs to Granola. Do not commit `app.asar` or the `.dmg`. The `.gitignore` covers both.
 - Running the script again is safe. It wipes and rebuilds the install folder and leaves your notes in `~/.config/Granola` alone.
 - `./uninstall.sh --purge` also removes the local notes cache and login.
+- When launched from the app menu, everything the app prints goes to `~/.local/state/granola/granola.log`. If you see an error popup, the full stack trace is in there. Running `~/Applications/granola/granola.sh` from a terminal prints it instead.
