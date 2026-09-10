@@ -36,7 +36,7 @@ One caveat: the generated launcher points at the FHS wrapper in the Nix store. I
 | ✅ | Encrypted local database that survives restarts |
 | ✅ | Microphone recording |
 | ✅ | The Granola Companion browser extension, in Chrome, Chromium, Brave, Edge, Vivaldi and Opera installed from a normal package. Flatpak and Snap browsers cannot reach the host program from inside their sandbox. |
-| ⚠️ | System audio capture is limited. The macOS build uses Core Audio to hear the other side of a call. On Linux the app falls back to a browser style capture path. |
+| ✅ | System audio, so the other side of a call gets transcribed. The main process records the default output's monitor with `parec` (PulseAudio, or PipeWire's Pulse server) and falls back to `pw-record`. Outside Nix you need one of those installed (`pulseaudio-utils` or `pipewire` on Debian/Ubuntu). Set `GRANOLA_SYSTEM_AUDIO_DEVICE` to record a different PulseAudio source, or `GRANOLA_SYSTEM_AUDIO_COMMAND` to supply your own command that writes mono 16-bit PCM at `{rate}` Hz to stdout. Without a capture tool you get a microphone-only session instead of an error. |
 | ❌ | Apple Calendar (EventKit). Google and Microsoft calendars still work, since those run on the server. |
 | ❌ | Global hotkeys |
 | ❌ | Auto-update. Run the script again with a newer `.dmg`. |

@@ -159,7 +159,28 @@ fi
 #    systemPreferences.askForMediaAccess. That API only exists on macOS, so
 #    the call throws and the renderer's permission request never resolves.
 #    Linux has no OS-level microphone prompt, so report it as granted.
-python3 - "$WORK/asar-ext/dist-electron/main/index.js" <<'PYEOF'
+#
+# 3. System audio. Transcribing the other side of a call needs the audio the
+#    machine is playing. The macOS build taps Core Audio and Windows uses a
+#    loopback device; on Linux the app falls into the browser path, where
+#    the renderer asks getDisplayMedia for system audio and the main process
+#    answers with a Windows loopback device id. Chromium cannot open that,
+#    the system source errors out one second in, and the whole session shows
+#    "We're having trouble transcribing your meeting" even though the
+#    microphone works. Chromium on Linux also hides PulseAudio monitor
+#    sources from web content, so the renderer cannot get it either.
+#
+#    The main process can: it spawns `parec` (PulseAudio, or PipeWire's
+#    Pulse server) on the default output's monitor, or `pw-record` as a
+#    fallback, and feeds the 16-bit PCM in as the system source, exactly the
+#    shape the renderer delivers. The renderer's system stream becomes a
+#    silent placeholder so it never errors; its silent buffers are dropped
+#    while the monitor capture is live and passed through (microphone-only
+#    session) when no capture tool is available. GRANOLA_SYSTEM_AUDIO_DEVICE
+#    picks another PulseAudio source, GRANOLA_SYSTEM_AUDIO_COMMAND replaces
+#    the command altogether ({rate} expands to the sample rate; it must
+#    write mono 16-bit little-endian PCM to stdout).
+python3 - "$WORK/asar-ext/dist-electron/main/index.js" "$WORK"/asar-ext/dist-app/assets/primary-*.js <<'PYEOF'
 import re, sys, pathlib
 p = pathlib.Path(sys.argv[1]); src = p.read_text()
 
@@ -192,7 +213,67 @@ apply("microphone permission prompt",
     r'await (\w+)\.systemPreferences\.askForMediaAccess\(`microphone`\)',
     lambda m: m.expand(r'(process.platform===`darwin`?await \1.systemPreferences.askForMediaAccess(`microphone`):!0)'))
 
+# System audio: a capture module spliced into the "browser" audio manager,
+# the one the app selects on Linux. It is defined inline because the manager
+# is one expression in a var list, so there is no statement boundary to hang
+# a function declaration on.
+capture = r'''(function(o){var cp=require("node:child_process"),child=null,active=false,gotData=false,level=0,peak=1500,gen=0,restarts=0,rate=16000;function candidates(){var r=String(rate),out=[];if(process.env.GRANOLA_SYSTEM_AUDIO_COMMAND)out.push({name:"custom",shell:process.env.GRANOLA_SYSTEM_AUDIO_COMMAND.replace(/\{rate\}/g,r)});var dev=process.env.GRANOLA_SYSTEM_AUDIO_DEVICE||"@DEFAULT_MONITOR@";out.push({name:"parec",cmd:"parec",args:["--device="+dev,"--format=s16le","--rate="+r,"--channels=1","--latency-msec=100","--stream-name=Granola system audio"]});out.push({name:"pw-record",cmd:"pw-record",args:["--rate",r,"--channels","1","--format","s16","-P","stream.capture.sink=true","--raw","-"]});return out}function spawnOne(list,idx,myGen){if(myGen!==gen||!active)return;if(idx>=list.length){o.log("warn","linux-system-audio-unavailable",{tried:list.map(function(c){return c.name}),hint:"install PulseAudio client tools (parec) or PipeWire (pw-record)"});return}var c=list[idx],p,done=false,got=false,carry=null,errText="";try{p=c.shell?cp.spawn(c.shell,{shell:true,stdio:["ignore","pipe","pipe"]}):cp.spawn(c.cmd,c.args,{stdio:["ignore","pipe","pipe"]})}catch(e){o.log("info","linux-system-audio-command-failed",{command:c.name,error:e.message});spawnOne(list,idx+1,myGen);return}child=p;p.stderr.on("data",function(d){errText=(errText+d.toString()).slice(-500)});p.stdout.on("data",function(d){if(myGen!==gen)return;if(!got){got=true;gotData=true;o.log("info","linux-system-audio-started",{command:c.name,rate:rate})}if(carry){d=Buffer.concat([carry,d]);carry=null}if(d.length%2){carry=Buffer.from(d.subarray(d.length-1));d=d.subarray(0,d.length-1)}if(!d.length)return;var n=d.length>>1,s=0;for(var i=0;i<n;i++){var v=d.readInt16LE(i*2);s+=v*v}var rms=Math.sqrt(s/n);peak=rms>peak?rms:Math.max(1500,peak*.9);level=Math.min(1,rms/peak);o.deliver(Buffer.from(d))});p.on("error",function(e){if(done||myGen!==gen)return;done=true;child=null;o.log("info","linux-system-audio-command-failed",{command:c.name,error:e.message});spawnOne(list,idx+1,myGen)});p.on("exit",function(code,sig){if(done||myGen!==gen)return;done=true;child=null;if(!got){o.log("info","linux-system-audio-command-exited-early",{command:c.name,code:code,signal:sig,stderr:errText});spawnOne(list,idx+1,myGen);return}if(active){o.log("warn","linux-system-audio-exited",{command:c.name,code:code,signal:sig,stderr:errText,restarts:restarts});restarts<5&&(restarts++,setTimeout(function(){spawnOne(list,idx,myGen)},1000))}})}return{start:function(r){rate=r||16000;gen++;active=true;gotData=false;level=0;peak=1500;restarts=0;spawnOne(candidates(),0,gen)},stop:function(){gen++;active=false;gotData=false;if(child){try{child.kill("SIGTERM")}catch(e){}child=null}},active:function(){return active&&gotData},level:function(){return level}}})'''
+
+# Locate the browser audio manager: the arrow function whose state starts
+# with `s=new VR(`browser`)` and which logs audio-capture-browser-restart.
+mgr = None
+for m in re.finditer(r'=\(\)=>\{let e=!1,t=0,i,a=\[\],o=\[\],s=new \w+\(`browser`\);', src):
+    end = src.find('initAudioProcessManagerModule:', m.end())
+    if end != -1 and 'audio-capture-browser-restart' in src[m.end():end]:
+        end = src.find('}}', end) + 2
+        mgr = (m.end(), end)
+        break
+if mgr is None:
+    print("    WARNING: could not find the browser audio manager; system audio stays unavailable on Linux")
+else:
+    body = src[mgr[0]:mgr[1]]
+    ids = {}
+    for key, pat in (("log", r'(\w+)\.f\(`info`,`audio-capture-browser-restart`'),
+                     ("lr", r',(\w+)\(\{microphoneBuffer:t\.microphoneBuffer,systemAudioBuffer:t\.systemAudioBuffer\}\)'),
+                     ("rate", r'sampleRate:(\w+)\(\),documentId:')):
+        mm = re.search(pat, body)
+        ids[key] = mm.group(1) if mm else None
+    if None in ids.values():
+        print(f"    WARNING: browser audio manager changed shape ({ids}); system audio stays unavailable on Linux")
+    else:
+        setup = ('var __lx=' + capture + '({deliver:function(buf){a.forEach(function(cb){cb(!1,buf,{systemCapturedAtUnixMs:Date.now()})}),'
+                 + ids["lr"] + '({microphoneBuffer:!1,systemAudioBuffer:buf})},log:function(l,ev,pl){' + ids["log"] + '.f(l,ev,pl)}});')
+        edits = [
+            ("start", r'(a\.push\(\w\),\w\(\{event:`start-audio-capture`,[^}]*documentId:\w\}\))\}',
+                      lambda m: m.group(1) + ',process.platform===`linux`&&__lx.start(' + ids["rate"] + '())}'),
+            ("stop", r'function m\(\)\{e=!1,t=0,i=void 0,', lambda m: 'function m(){__lx.stop(),e=!1,t=0,i=void 0,'),
+            ("buffers", r'case`audio-capture-buffer`:(\w)\.forEach\((\w)=>\2\((\w)\.microphoneBuffer',
+                        lambda m: 'case`audio-capture-buffer`:__lx.active()&&(' + m.group(3) + '.systemAudioBuffer=!1);' + m.group(0)[len('case`audio-capture-buffer`:'):]),
+            ("volume", r'case`audio-volume`:(\w+)\(`audio-volume`,\{system:(\w)\.system',
+                       lambda m: 'case`audio-volume`:__lx.active()&&(' + m.group(2) + '.system=__lx.level());' + m.group(0)[len('case`audio-volume`:'):]),
+        ]
+        ok = True
+        for name, pat, rep in edits:
+            body, n = re.subn(pat, rep, body, count=1)
+            if not n:
+                print(f"    WARNING: system audio patch point '{name}' not found; system audio stays unavailable on Linux")
+                ok = False
+                break
+        if ok:
+            src = src[:mgr[0]] + setup + body + src[mgr[1]:]
+            print("    patched: Linux system audio capture")
+
 p.write_text(src)
+
+# Renderer: the system-audio stream request. On Linux hand back a silent
+# stream instead of calling getDisplayMedia, which cannot succeed there.
+# function q9n(e){return navigator.mediaDevices.getDisplayMedia({audio:{sampleRate:e},video:!1})}
+for rp in map(pathlib.Path, sys.argv[2:]):
+    src = rp.read_text()
+    apply(f"system audio stream in {rp.name}",
+        r'function (\w+)\((\w)\)\{return navigator\.mediaDevices\.getDisplayMedia\(\{audio:\{sampleRate:\2\},video:!1\}\)\}',
+        lambda m: m.expand(r'function \1(\2){if(window.electron.platform===`linux`){let c=new AudioContext({sampleRate:\2}),d=c.createMediaStreamDestination();return c.resume().catch(()=>{}).then(()=>d.stream)}return navigator.mediaDevices.getDisplayMedia({audio:{sampleRate:\2},video:!1})}'))
+    rp.write_text(src)
 PYEOF
 
 # Asars usually mark only *files* as unpacked (their directories stay

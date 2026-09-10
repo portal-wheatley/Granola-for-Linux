@@ -52,6 +52,8 @@
               nss
               pango
               pciutils
+              pipewire    # pw-record: system audio capture fallback
+              pulseaudio  # parec: system audio capture from the output monitor
               udev
               libx11
               libxcb
